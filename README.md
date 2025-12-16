@@ -35,6 +35,3 @@ python mp4_tag_remux.py movie_src.mp4 movie_tagged.mp4 --tag title="My Movie" --
 ```bash
 python mp4_tag_remux.py src.mp4 dst.mp4 -t album=MyAlbum -l a:0=eng
 ```
-
-Want more features?
-- Batch processing, cover art embedding, or GUI — tell me which and I'll extend the tool.
