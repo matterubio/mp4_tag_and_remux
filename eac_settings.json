@@ -1,8 +1,0 @@
-{
-  "ripper_cmd": "EAC -outputdirectory \"{outdir}\" -extractwav -nomultisession -nocdtext -drive {device} -extractionwindowclose -close",
-  "outdir": "C:\\Users\\mateo\\Music",
-  "drive": "0",
-  "encoder": "lame",
-  "encoder_options": "--preset extreme",
-  "notes": "Placeholders: {outdir} and {device}. Adjust paths and options to your EAC setup."
-}
