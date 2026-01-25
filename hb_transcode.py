@@ -20,7 +20,8 @@ import shutil
 import subprocess
 import sys
 from typing import List
-
+from pgsrip import pgsrip, Mkv, Options
+from babelfish import Language
 
 def find_mkvs(input_dir: str, recursive: bool = False) -> List[str]:
     pattern = "*.mkv"
@@ -166,58 +167,47 @@ def extract_english_subtitles(infile: str, out_srt: str, dry_run: bool = False) 
             logging.error('ffmpeg executable not found at %s', ffmpeg)
 
     # Fallback to pgsrip for PGS subtitles (or after ffmpeg failure)
-    pgsrip = shutil.which('pgsrip') or shutil.which('pgsrip.exe')
-    if not pgsrip:
+    pgsrip_exists = shutil.which('pgsrip') or shutil.which('pgsrip.exe')
+    if not pgsrip_exists:
         logging.error('pgsrip not found on PATH; cannot extract PGS subtitles for %s', infile)
         return False
 
-    # Try several common pgsrip invocation patterns
-    pgs_cmds = [
-#        [pgsrip, '-i', infile, '-o', out_srt, '-w 4'],
-        [pgsrip, f'"{infile}"', '-w 4', '-l eng'],
-#        [pgsrip, infile, out_srt, '-w 4'],
-    ]
-    for cmd in pgs_cmds:
-        logging.info('Attempting pgsrip command: %s', ' '.join(cmd))
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True)
-            if p.stdout:
-                logging.debug(p.stdout)
-            if p.stderr:
-                logging.debug(p.stderr)
-            if p.returncode == 0:
-                # pgsrip no longer accepts an explicit output filename in many
-                # versions; it writes <input_basename>.en.srt next to the input
-                # file. Check for both the requested out_srt and that default
-                # filename, moving it if necessary.
-                if os.path.exists(out_srt):
-                    logging.info('pgsrip wrote subtitles: %s', out_srt)
-                    return True
+    # Rip subtitles using pgsrip
+    logging.info('Extracting English subtitles with pgsrip: %s', out_srt)
+    try:
+        media = Mkv(infile)
+        options = Options(languages=[Language('eng')], overwrite=False, one_per_lang=True)
+        pgsrip.rip(media, options)
+        # pgsrip no longer accepts an explicit output filename in many
+        # versions; it writes <input_basename>.en.srt next to the input
+        # file. Check for both the requested out_srt and that default
+        # filename, moving it if necessary.
+        if os.path.exists(out_srt):
+            logging.info('pgsrip wrote subtitles: %s', out_srt)
+            return True
 
-                # default pgsrip output name (in same dir as input)
-                pgs_default_name = os.path.splitext(os.path.basename(infile))[0] + '.en.srt'
-                pgs_default_path = os.path.join(os.path.dirname(infile), pgs_default_name)
-                if os.path.exists(pgs_default_path):
-                    try:
-                        ensure_output_path(os.path.dirname(out_srt))
-                    except Exception:
-                        pass
-                    try:
-                        os.replace(pgs_default_path, out_srt)
-                        logging.info('Moved pgsrip output %s -> %s', pgs_default_path, out_srt)
-                        return True
-                    except Exception as e:
-                        logging.error('Failed to move pgsrip output %s to %s: %s', pgs_default_path, out_srt, e)
-                        # continue to try other commands if available
-                else:
-                    logging.debug('pgsrip returned 0 but no output found at %s or %s', out_srt, pgs_default_path)
-        except FileNotFoundError:
-            logging.error('pgsrip executable not found at %s', pgsrip)
-            break
-
-    logging.error('pgsrip failed to extract subtitles for %s', infile)
-    return False
-
+        # default pgsrip output name (in same dir as input)
+        pgs_default_name = os.path.splitext(os.path.basename(infile))[0] + '.en.srt'
+        pgs_default_path = os.path.join(os.path.dirname(infile), pgs_default_name)
+        if os.path.exists(pgs_default_path):
+            try:
+                ensure_output_path(os.path.dirname(out_srt))
+            except Exception:
+                pass 
+            try:
+                shutil.move(pgs_default_path, out_srt)
+                logging.info('Moved pgsrip output %s -> %s', pgs_default_path, out_srt)
+                return True
+            except Exception as e:
+                logging.error('Failed to move pgsrip output %s to %s: %s', pgs_default_path, out_srt, e)
+                # continue to try other commands if available
+        else:
+            logging.debug('pgsrip returned 0 but no output found at %s or %s', out_srt, pgs_default_path)
+    except FileNotFoundError:
+        logging.error('pgsrip executable not found at %s', pgsrip)
+    except:
+        logging.error('pgsrip failed to extract subtitles for %s', infile)
+        return False
 
 def embed_mp4_title(mp4_path: str, title: str) -> bool:
     """Use ffmpeg to set the MP4 title metadata without re-encoding (copy streams).
@@ -382,7 +372,7 @@ def main():
                     logging.warning('Failed to embed title for %s: %s', outpath, e)
             # extract English subtitles to .default.srt if requested
             if args.extract_subs:
-                srt_path = os.path.splitext(outpath)[0] + '.default.srt'
+                srt_path = os.path.splitext(outpath)[0] + '.default.en.srt'
                 if dry_run:
                     # already logged preview above
                     pass
