@@ -13,6 +13,7 @@ Requires HandBrakeCLI available on PATH or provided via --handbrake.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -77,6 +78,147 @@ def transcode_one(hb_path: str, infile: str, outfile: str, preset: str, dry_run:
         return 2
 
 
+def find_english_subtitle_info(infile: str) -> tuple[int, str] | None:
+    """Return (relative_sub_index, codec_name) for the English subtitle stream.
+
+    Uses ffprobe to inspect streams. Returns None if no English subtitle stream is found
+    or ffprobe isn't available.
+    """
+    ffprobe = shutil.which('ffprobe') or shutil.which('ffprobe.exe')
+    if not ffprobe:
+        logging.debug('ffprobe not found; cannot inspect subtitles for %s', infile)
+        return None
+    cmd = [ffprobe, '-v', 'error', '-print_format', 'json', '-show_streams', infile]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0 or not p.stdout:
+            logging.debug('ffprobe failed for %s: %s', infile, p.stderr)
+            return None
+        data = json.loads(p.stdout)
+    except Exception as e:
+        logging.debug('ffprobe JSON parse error for %s: %s', infile, e)
+        return None
+
+    streams = data.get('streams', [])
+    # First pass: prefer explicit language tag starting with 'en'
+    sub_idx = 0
+    for s in streams:
+        if s.get('codec_type') == 'subtitle':
+            tags = s.get('tags') or {}
+            lang = (tags.get('language') or '').lower()
+            if lang.startswith('en'):
+                return sub_idx, s.get('codec_name', '')
+            sub_idx += 1
+
+    # Second pass: prefer disposition default
+    sub_idx = 0
+    for s in streams:
+        if s.get('codec_type') == 'subtitle':
+            disp = s.get('disposition') or {}
+            if int(disp.get('default', 0)) == 1:
+                return sub_idx, s.get('codec_name', '')
+            sub_idx += 1
+
+    return None
+
+
+def extract_english_subtitles(infile: str, out_srt: str, dry_run: bool = False) -> bool:
+    """Extract the first matching English subtitle stream to an SRT file (ffmpeg).
+
+    The output filename should already end with ".default.srt".
+    Returns True if an extraction was performed (or would be, in dry-run) and False otherwise.
+    """
+    info = find_english_subtitle_info(infile)
+    if info is None:
+        logging.info('No English subtitle stream found in %s', infile)
+        return False
+    rel_idx, codec = info
+
+    ffmpeg = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
+    if not ffmpeg:
+        logging.warning('ffmpeg not available; cannot extract subtitles for %s', infile)
+        # we may still be able to use pgsrip if installed and codec is pgs
+    # If codec is PGS-like, prefer pgsrip extraction
+    is_pgs = 'pgs' in (codec or '').lower() or 'hdmv' in (codec or '').lower()
+
+    if dry_run:
+        if is_pgs:
+            logging.info('Dry-run: would extract PGS subtitles (codec=%s) from %s to %s using pgsrip', codec, infile, out_srt)
+        else:
+            logging.info('Dry-run: would extract subtitle stream %s from %s to %s using ffmpeg', rel_idx, infile, out_srt)
+        return True
+
+    # Try ffmpeg extraction for non-PGS streams
+    if not is_pgs and ffmpeg:
+        cmd = [ffmpeg, '-i', infile, '-map', f'0:s:{rel_idx}', '-c:s', 'srt', out_srt, '-y']
+        logging.info('Extracting English subtitles with ffmpeg: %s', out_srt)
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.stdout:
+                logging.debug(p.stdout)
+            if p.stderr:
+                logging.debug(p.stderr)
+            if p.returncode == 0 and os.path.exists(out_srt):
+                logging.info('Wrote subtitles: %s', out_srt)
+                return True
+            logging.warning('ffmpeg failed to extract subtitles for %s (exit %s); will attempt pgsrip if available', infile, p.returncode)
+        except FileNotFoundError:
+            logging.error('ffmpeg executable not found at %s', ffmpeg)
+
+    # Fallback to pgsrip for PGS subtitles (or after ffmpeg failure)
+    pgsrip = shutil.which('pgsrip') or shutil.which('pgsrip.exe')
+    if not pgsrip:
+        logging.error('pgsrip not found on PATH; cannot extract PGS subtitles for %s', infile)
+        return False
+
+    # Try several common pgsrip invocation patterns
+    pgs_cmds = [
+#        [pgsrip, '-i', infile, '-o', out_srt, '-w 4'],
+        [pgsrip, f'"{infile}"', '-w 4', '-l eng'],
+#        [pgsrip, infile, out_srt, '-w 4'],
+    ]
+    for cmd in pgs_cmds:
+        logging.info('Attempting pgsrip command: %s', ' '.join(cmd))
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.stdout:
+                logging.debug(p.stdout)
+            if p.stderr:
+                logging.debug(p.stderr)
+            if p.returncode == 0:
+                # pgsrip no longer accepts an explicit output filename in many
+                # versions; it writes <input_basename>.en.srt next to the input
+                # file. Check for both the requested out_srt and that default
+                # filename, moving it if necessary.
+                if os.path.exists(out_srt):
+                    logging.info('pgsrip wrote subtitles: %s', out_srt)
+                    return True
+
+                # default pgsrip output name (in same dir as input)
+                pgs_default_name = os.path.splitext(os.path.basename(infile))[0] + '.en.srt'
+                pgs_default_path = os.path.join(os.path.dirname(infile), pgs_default_name)
+                if os.path.exists(pgs_default_path):
+                    try:
+                        ensure_output_path(os.path.dirname(out_srt))
+                    except Exception:
+                        pass
+                    try:
+                        os.replace(pgs_default_path, out_srt)
+                        logging.info('Moved pgsrip output %s -> %s', pgs_default_path, out_srt)
+                        return True
+                    except Exception as e:
+                        logging.error('Failed to move pgsrip output %s to %s: %s', pgs_default_path, out_srt, e)
+                        # continue to try other commands if available
+                else:
+                    logging.debug('pgsrip returned 0 but no output found at %s or %s', out_srt, pgs_default_path)
+        except FileNotFoundError:
+            logging.error('pgsrip executable not found at %s', pgsrip)
+            break
+
+    logging.error('pgsrip failed to extract subtitles for %s', infile)
+    return False
+
+
 def embed_mp4_title(mp4_path: str, title: str) -> bool:
     """Use ffmpeg to set the MP4 title metadata without re-encoding (copy streams).
 
@@ -132,6 +274,7 @@ def main():
     parser.add_argument('--output', '-o', required=True, help='Output directory for .mp4 files')
     parser.add_argument('--preset', '-p', required=True, help='HandBrake preset name (pass to -Z). Example: "Fast 1080p30"')
     parser.add_argument('--recursive', '-r', action='store_true', help='Recursively find .mkv files under input')
+    parser.add_argument('--extract-subs', action='store_true', help='If present, extract English subtitles to a .default.srt alongside the MP4')
     parser.add_argument('--handbrake', help='Path to HandBrakeCLI executable (optional)')
     parser.add_argument('--dry-run', action='store_true', help='Show commands without executing')
 
@@ -216,6 +359,16 @@ def main():
             metadata_title = base.replace(' - ', ': ', 1)
             logging.info('Dry-run: would create MP4: %s', outpath)
             logging.info('Dry-run: would embed title: %s', metadata_title)
+            # Dry-run: preview subtitle extraction if requested
+            if args.extract_subs:
+                srt_preview = os.path.splitext(outpath)[0] + '.default.srt'
+                # attempt to detect subs (ffprobe) and report
+                info = find_english_subtitle_info(mkv)
+                if info is None:
+                    logging.info('Dry-run: no English subtitles found in %s', mkv)
+                else:
+                    rel, codec = info
+                    logging.info('Dry-run: would extract English subtitles to: %s (stream #%s codec=%s)', srt_preview, rel, codec)
         if ret != 0:
             logging.error('Transcode failed for %s (exit %s)', mkv, ret)
             failures += 1
@@ -227,6 +380,22 @@ def main():
                     embed_mp4_title(outpath, base)
                 except Exception as e:
                     logging.warning('Failed to embed title for %s: %s', outpath, e)
+            # extract English subtitles to .default.srt if requested
+            if args.extract_subs:
+                srt_path = os.path.splitext(outpath)[0] + '.default.srt'
+                if dry_run:
+                    # already logged preview above
+                    pass
+                else:
+                    # ensure target dir exists
+                    try:
+                        ensure_output_path(os.path.dirname(srt_path))
+                    except Exception:
+                        pass
+                    try:
+                        extract_english_subtitles(mkv, srt_path, dry_run=False)
+                    except Exception as e:
+                        logging.warning('Failed to extract subtitles for %s: %s', mkv, e)
 
     logging.info('Summary: total=%d, succeeded=%d, failed=%d', total, successes, failures)
     if failures:
