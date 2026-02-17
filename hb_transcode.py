@@ -25,14 +25,35 @@ from babelfish import Language
 
 def find_mkvs(input_dir: str, recursive: bool = False) -> List[str]:
     pattern = "*.mkv"
+
+    def _path_contains_ignored_dir(path: str) -> bool:
+        try:
+            rel = os.path.relpath(path, input_dir)
+        except Exception:
+            rel = path
+        parts = rel.split(os.sep)
+        for p in parts:
+            if p in ('.', ''):
+                continue
+            if p.lower().startswith('ignore'):
+                return True
+        return False
+
     if recursive:
         matches = []
-        for root, _, files in os.walk(input_dir):
+        for root, dirs, files in os.walk(input_dir):
+            # Prune directories we should ignore so os.walk doesn't descend into them
+            dirs[:] = [d for d in dirs if not d.lower().startswith('ignore')]
+            if _path_contains_ignored_dir(root):
+                continue
             for f in files:
                 if f.lower().endswith('.mkv'):
                     matches.append(os.path.join(root, f))
         return sorted(matches)
     else:
+        # If the input directory itself is an ignored folder, return empty
+        if _path_contains_ignored_dir(input_dir):
+            return []
         return sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.lower().endswith('.mkv')])
 
 
@@ -61,14 +82,34 @@ def find_handbrake_cli(override: str | None = None) -> str | None:
 
 
 def transcode_one(hb_path: str, infile: str, outfile: str, preset: str, dry_run: bool = False) -> int:
-    cmd = [hb_path, '-i', infile, '-o', outfile, '-Z', preset]
+    # Ensure HandBrake includes all English audio tracks from the source
+    # `--audio-lang-list eng` restricts to English; `--all-audio` ensures all matching
+    # audio streams are kept rather than just a single default.
+    cmd = [
+        hb_path,
+        '-i', infile,
+        '-o', outfile,
+        '-Z', preset,
+        '--audio-lang-list', 'eng',
+        '--all-audio'
+        ]
     cmd_str = ' '.join(f'"{p}"' if ' ' in p else p for p in cmd)
     logging.info('Running: %s', cmd_str)
     if dry_run:
         return 0
     try:
         # capture output so we can log it
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        # Read the output line by line as it is generated
+        while True:
+            output = proc.stdout.readline()
+            # If the line is empty and the process has finished, break the loop
+            if not output and proc.poll() is not None:
+                break
+            if output:
+                # Print the output in real-time, flushing the buffer immediately
+                print(output.strip(), flush=True)
+        # Continue once the process has finished
         if proc.stdout:
             logging.info(proc.stdout)
         if proc.stderr:
@@ -91,7 +132,17 @@ def find_english_subtitle_info(infile: str) -> tuple[int, str] | None:
         return None
     cmd = [ffprobe, '-v', 'error', '-print_format', 'json', '-show_streams', infile]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        # Read the output line by line as it is generated
+        while True:
+            output = p.stdout.readline()
+            # If the line is empty and the process has finished, break the loop
+            if not output and p.poll() is not None:
+                break
+            if output:
+                # Print the output in real-time, flushing the buffer immediately
+                print(output.strip(), flush=True)
+        # Continue once the process has finished
         if p.returncode != 0 or not p.stdout:
             logging.debug('ffprobe failed for %s: %s', infile, p.stderr)
             return None
@@ -141,20 +192,113 @@ def extract_english_subtitles(infile: str, out_srt: str, dry_run: bool = False) 
         # we may still be able to use pgsrip if installed and codec is pgs
     # If codec is PGS-like, prefer pgsrip extraction
     is_pgs = 'pgs' in (codec or '').lower() or 'hdmv' in (codec or '').lower()
+    is_vobsub = 'vobsub' in (codec or '').lower() or 'dvd_subtitle' in (codec or '').lower()
 
     if dry_run:
         if is_pgs:
             logging.info('Dry-run: would extract PGS subtitles (codec=%s) from %s to %s using pgsrip', codec, infile, out_srt)
+        elif is_vobsub:
+            logging.info('Dry-run: would extract VOBSUB subtitles (codec=%s) from %s to %s using mkvmerge/mkvextract + SubtitleEdit', codec, infile, out_srt)
         else:
             logging.info('Dry-run: would extract subtitle stream %s from %s to %s using ffmpeg', rel_idx, infile, out_srt)
         return True
+
+    if not is_pgs and is_vobsub:
+        cmd = ['mkvmerge', '-J', infile]
+        logging.info('Looking for English subtitles as VOBSUB with mkvmerge: %s', out_srt)
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            # Read the output line by line as it is generated
+            while True:
+                output = p.stdout.readline()
+                # If the line is empty and the process has finished, break the loop
+                if not output and p.poll() is not None:
+                    break
+                if output:
+                    # Print the output in real-time, flushing the buffer immediately
+                    print(output.strip(), flush=True)
+            # Continue once the process has finished
+            if p.returncode != 0 or not p.stdout:
+                logging.warning('mkvmerge failed for %s: %s', infile, p.stderr)
+                return False
+            data = json.loads(p.stdout)
+            tracks = data.get('tracks', [])
+            sub_tracks = [t for t in tracks if t.get('type') == 'subtitles']
+
+            # Instead of relying on rel_idx, look for the first subtitle track with a language tag starting with 'en'
+            track_id = None
+            for t in sub_tracks:
+                lang = t.get('properties', {}).get('language', {})
+                if lang.startswith('en'):
+                    track_id = t.get('id')
+                    break
+            if track_id is None:
+                logging.warning('mkvmerge did not return an id for English subtitle stream index %s', infile)
+                return False
+            out_vobsub = os.path.splitext(out_srt)[0] + '.sub'
+            extract_cmd = ['mkvextract', 'tracks', infile, f'{track_id}:{out_vobsub}']
+            p2 = subprocess.Popen(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            # Read the output line by line as it is generated
+            while True:
+                output = p2.stdout.readline()
+                # If the line is empty and the process has finished, break the loop
+                if not output and p2.poll() is not None:
+                    break
+                if output:
+                    # Print the output in real-time, flushing the buffer immediately
+                    print(output.strip(), flush=True)
+            # Continue once the process has finished 
+            if p2.returncode == 0 and os.path.exists(out_vobsub):
+                logging.info('Wrote VobSub subtitles with mkvextract: %s', out_vobsub)
+                subtitleedit = shutil.which('SubtitleEdit') or shutil.which('SubtitleEdit.exe')
+                if subtitleedit:
+                    se_cmd = [subtitleedit, '/convert', out_vobsub, 'srt', '/FixCommonErrors', f'/outputfilename:{out_srt}']
+                    logging.info('Converting VobSub to SRT with SubtitleEdit: %s', out_srt)
+                    try:
+                        p3 = subprocess.Popen(se_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                        # Read the output line by line as it is generated
+                        while True:
+                            output = p3.stdout.readline()
+                            # If the line is empty and the process has finished, break the loop
+                            if not output and p3.poll() is not None:
+                                break
+                            if output:
+                                # Print the output in real-time, flushing the buffer immediately
+                                print(output.strip(), flush=True)
+                        # Continue once the process has finished
+                        if p3.returncode == 0 and os.path.exists(out_srt):
+                            os.remove(out_vobsub)
+                            os.remove(os.path.splitext(out_vobsub)[0] + '.idx')
+                            logging.info('Converted VobSub to SRT: %s', out_srt)
+                            return True
+                        else:
+                            logging.warning('SubtitleEdit failed to convert VobSub for %s (exit %s): %s', infile, p3.returncode, p3.stderr)
+                    except FileNotFoundError:
+                        logging.error('SubtitleEdit executable not found at %s', subtitleedit)
+                else:
+                    logging.warning('SubtitleEdit not found; extracted VobSub but cannot convert to SRT for %s', infile)
+                return True
+            else:
+                logging.warning('mkvextract failed for %s: %s', infile, p2.stderr)
+        except Exception as e:
+            logging.warning('Failed to look for VobSub subtitles using mkvmerge for %s: %s', infile, e)
 
     # Try ffmpeg extraction for non-PGS streams
     if not is_pgs and ffmpeg:
         cmd = [ffmpeg, '-i', infile, '-map', f'0:s:{rel_idx}', '-c:s', 'srt', out_srt, '-y']
         logging.info('Extracting English subtitles with ffmpeg: %s', out_srt)
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True)
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            # Read the output line by line as it is generated
+            while True:
+                output = p.stdout.readline()
+                # If the line is empty and the process has finished, break the loop
+                if not output and p.poll() is not None:
+                    break
+                if output:
+                    # Print the output in real-time, flushing the buffer immediately
+                    print(output.strip(), flush=True)
+            # Continue once the process has finished
             if p.stdout:
                 logging.debug(p.stdout)
             if p.stderr:
@@ -225,10 +369,20 @@ def embed_mp4_title(mp4_path: str, title: str) -> bool:
     # If the input filename uses " - " as a separator, treat the first instance
     # as a visual separator and convert it to ": " in the embedded title.
     metadata_title = title.replace(' - ', ': ', 1)
-    cmd = [ffmpeg, '-i', mp4_path, '-c', 'copy', '-metadata', f'title={metadata_title}', tmp, '-y']
+    cmd = [ffmpeg, '-i', mp4_path, '-map', '0', '-c', 'copy', '-metadata', f'title={metadata_title}', tmp, '-y']
     logging.info('Embedding title metadata: %s (from input: %s)', metadata_title, title)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        # Read the output line by line as it is generated
+        while True:
+            output = p.stdout.readline()
+            # If the line is empty and the process has finished, break the loop
+            if not output and p.poll() is not None:
+                break
+            if output:
+                # Print the output in real-time, flushing the buffer immediately
+                print(output.strip(), flush=True)
+        # Continue once the process has finished
         if p.stdout:
             logging.info(p.stdout)
         if p.stderr:
