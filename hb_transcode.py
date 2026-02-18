@@ -232,7 +232,7 @@ def extract_english_subtitles(infile: str, out_srt: str, dry_run: bool = False) 
                     se_cmd = [subtitleedit, '/convert', out_vobsub, 'srt', '/FixCommonErrors', f'/outputfilename:{out_srt}']
                     logging.info('Converting VobSub to SRT with SubtitleEdit: %s', out_srt)
                     try:
-                        p3 = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        p3 = subprocess.run(se_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                         if p3.stdout:
                             logging.info(p3.stdout)
                         if p3.stderr:
