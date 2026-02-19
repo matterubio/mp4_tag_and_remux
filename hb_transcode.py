@@ -85,13 +85,14 @@ def find_handbrake_cli(override: str | None = None) -> str | None:
 def transcode_one(hb_path: str, infile: str, outfile: str, preset: str, dry_run: bool = False) -> int:
     # Ensure HandBrake includes all English audio tracks from the source
     # `--audio-lang-list eng` restricts to English; `--all-audio` ensures all matching
+    # `--audio-lang-list und` with `--all-audio` keeps all audio streams regardless of language, which is often desirable to preserve commentary tracks, etc. If you want to restrict to English, change to `eng` instead of `und`.
     # audio streams are kept rather than just a single default.
     cmd = [
         hb_path,
         '-i', infile,
         '-o', outfile,
         '-Z', preset,
-        '--audio-lang-list', 'eng',
+        '--audio-lang-list', 'und',
         '--all-audio'
         ]
     cmd_str = ' '.join(f'"{p}"' if ' ' in p else p for p in cmd)
